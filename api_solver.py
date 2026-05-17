@@ -1,15 +1,19 @@
 import os
 import sys
+import html
 import time
 import uuid
 import json
 import random
+import secrets
 import logging
 import asyncio
 import argparse
+import atexit
 from collections import deque
 from contextlib import suppress
-from quart import Quart, request, jsonify
+from quart import Quart, request, jsonify, session, redirect
+from werkzeug.security import check_password_hash
 from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
 
@@ -56,6 +60,21 @@ logger.addHandler(handler)
 DEFAULT_LIVE_TEST_URL = "https://appointment.ivacbd.com/signin"
 DEFAULT_LIVE_TEST_SITEKEY = "0x4AAAAAACghKkJHL1t7UkuZ"
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ADMIN_JSON_PATH = os.path.join(_APP_DIR, "admin.json")
+
+# Extra Chromium flags to trim background work (Playwright chromium/chrome/msedge only).
+_CHROMIUM_LOW_RESOURCE_ARGS = (
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+)
+
+RESULTS_SAVE_DEBOUNCE_SEC = 15.0
+
 
 class TurnstileAPIServer:
     HTML_TEMPLATE = """
@@ -64,7 +83,8 @@ class TurnstileAPIServer:
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Turnstile Solver</title>
+        <title>Cloudflare Turnstile Solver</title>
+        <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async></script>
         <script>
             async function fetchIP() {
@@ -80,15 +100,27 @@ class TurnstileAPIServer:
             window.onload = fetchIP;
         </script>
     </head>
-    <body>
-        <!-- cf turnstile -->
-        <p id="ip-display">Fetching your IP...</p>
+    <body class="flex min-h-screen flex-col items-center justify-center gap-8 bg-zinc-950 p-6 font-sans text-zinc-300 antialiased">
+        <div class="w-full max-w-md space-y-6 text-center">
+            <div class="flex justify-center rounded-xl border border-zinc-800/80 bg-zinc-900/50 p-6 shadow-xl shadow-black/30">
+                <!-- cf turnstile -->
+            </div>
+            <p id="ip-display" class="text-sm text-zinc-500">Fetching your IP...</p>
+        </div>
     </body>
     </html>
     """
 
     def __init__(self, headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool):
         self.app = Quart(__name__)
+        secret_key = os.environ.get("SECRET_KEY")
+        if not secret_key:
+            secret_key = secrets.token_hex(32)
+            logger.warning(
+                "SECRET_KEY is not set; using a random key. "
+                "Admin sessions reset on every restart. Set SECRET_KEY for stable cookies."
+            )
+        self.app.secret_key = secret_key
         self.debug = debug
         self.results = self._load_results()
         self.api_keys, self.api_key_records = self._load_api_keys()
@@ -111,6 +143,10 @@ class TurnstileAPIServer:
         self.shelf_running = False
         self._shelf_loop_task = None
         self.proxy_support = proxy_support
+        self._proxies_cache_path = None
+        self._proxies_cache_mtime = None
+        self._proxies_cache_list = []
+        self._results_save_task = None
         self.browser_pool = asyncio.Queue()
         self.browser_args = []
         self.playwright = None
@@ -119,6 +155,65 @@ class TurnstileAPIServer:
             self.browser_args.append(f"--user-agent={useragent}")
 
         self._setup_routes()
+        atexit.register(self._flush_results_to_disk_sync_at_exit)
+
+    def _get_proxies_list_cached(self):
+        """Load proxies.txt with mtime cache to avoid re-reading on every solve."""
+        path = os.path.join(os.getcwd(), "proxies.txt")
+        if not os.path.isfile(path):
+            self._proxies_cache_path = path
+            self._proxies_cache_mtime = None
+            self._proxies_cache_list = []
+            return []
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return self._proxies_cache_list if self._proxies_cache_path == path else []
+        if self._proxies_cache_path == path and self._proxies_cache_mtime == mtime:
+            return self._proxies_cache_list
+        try:
+            with open(path, encoding="utf-8") as proxy_file:
+                lines = [line.strip() for line in proxy_file if line.strip()]
+        except OSError as e:
+            if self.debug:
+                logger.warning(f"Could not read proxies.txt: {e}")
+            return self._proxies_cache_list if self._proxies_cache_path == path else []
+        self._proxies_cache_path = path
+        self._proxies_cache_mtime = mtime
+        self._proxies_cache_list = lines
+        return lines
+
+    async def _request_debounced_results_save(self):
+        """Coalesce results.json writes; flushes RESULTS_SAVE_DEBOUNCE_SEC after the last success."""
+        if self._results_save_task is not None and not self._results_save_task.done():
+            self._results_save_task.cancel()
+        self._results_save_task = asyncio.create_task(self._debounced_flush_results_delay())
+
+    async def _debounced_flush_results_delay(self):
+        task = asyncio.current_task()
+        try:
+            await asyncio.sleep(RESULTS_SAVE_DEBOUNCE_SEC)
+            self._flush_results_to_disk_sync()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._results_save_task is task:
+                self._results_save_task = None
+
+    def _flush_results_to_disk_sync(self):
+        """Write self.results to results.json (synchronous)."""
+        try:
+            with open("results.json", "w") as result_file:
+                json.dump(self.results, result_file, indent=4)
+        except IOError as e:
+            logger.error(f"Error saving results to file: {str(e)}")
+
+    def _flush_results_to_disk_sync_at_exit(self):
+        """Best-effort flush on process exit (sync; event loop may be gone)."""
+        t = self._results_save_task
+        if t is not None and not t.done():
+            t.cancel()
+        self._flush_results_to_disk_sync()
 
     @staticmethod
     def _load_results():
@@ -130,14 +225,6 @@ class TurnstileAPIServer:
         except (json.JSONDecodeError, IOError) as e:
             logger.warning(f"Error loading results: {str(e)}. Starting with an empty results dictionary.")
         return {}
-
-    def _save_results(self):
-        """Save results to results.json."""
-        try:
-            with open("results.json", "w") as result_file:
-                json.dump(self.results, result_file, indent=4)
-        except IOError as e:
-            logger.error(f"Error saving results to file: {str(e)}")
 
     @staticmethod
     def _load_api_keys():
@@ -264,9 +351,108 @@ class TurnstileAPIServer:
         if not dq:
             del self.shelf[key]
 
+    @staticmethod
+    def _load_admin_record():
+        try:
+            if os.path.exists(ADMIN_JSON_PATH):
+                with open(ADMIN_JSON_PATH, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("username") and data.get("password_hash"):
+                    return data
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Could not load admin.json: {e}")
+        return None
+
+    def _require_admin_session(self):
+        if not session.get("admin"):
+            return jsonify({"success": False, "error": "Unauthorized", "loginRequired": True}), 401
+        return None
+
+    @staticmethod
+    def _render_login_page(error=None, notice=None):
+        err_html = (
+            f'<p class="mb-4 rounded-lg border border-rose-500/30 bg-rose-950/40 px-3 py-2 text-sm text-rose-200">{html.escape(error)}</p>'
+            if error
+            else ""
+        )
+        note_html = (
+            f'<p class="mb-4 rounded-lg border border-cyan-500/25 bg-cyan-950/30 px-3 py-2 text-sm text-cyan-100/90">{html.escape(notice)}</p>'
+            if notice
+            else ""
+        )
+        tailwind_inline = (
+            "        tailwind.config = { theme: { extend: { fontFamily: "
+            "{ sans: ['DM Sans', 'system-ui', 'sans-serif'] } } } } };"
+        )
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin login — Cloudflare Turnstile Solver</title>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+{tailwind_inline}
+    </script>
+</head>
+<body class="min-h-screen bg-zinc-950 font-sans text-zinc-300 antialiased">
+    <div class="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_100%_60%_at_50%_-20%,rgba(34,211,238,0.07),transparent_55%)]"></div>
+    <div class="relative mx-auto flex min-h-screen max-w-md flex-col justify-center px-4 py-12">
+        <p class="mb-1 text-center text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500">Cloudflare Turnstile solver</p>
+        <h1 class="mb-8 text-center text-xl font-semibold tracking-tight text-white">Admin sign in</h1>
+        <div class="rounded-2xl border border-zinc-800/80 bg-zinc-900/50 p-6 shadow-xl shadow-black/30">
+            {note_html}
+            {err_html}
+            <form method="post" action="/login" class="space-y-4">
+                <div>
+                    <label for="username" class="mb-1 block text-sm font-medium text-zinc-400">Username</label>
+                    <input id="username" name="username" type="text" autocomplete="username" required
+                        class="w-full rounded-lg border border-zinc-800 bg-zinc-950/80 px-3 py-2 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-cyan-500/40" />
+                </div>
+                <div>
+                    <label for="password" class="mb-1 block text-sm font-medium text-zinc-400">Password</label>
+                    <input id="password" name="password" type="password" autocomplete="current-password" required
+                        class="w-full rounded-lg border border-zinc-800 bg-zinc-950/80 px-3 py-2 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/40" />
+                </div>
+                <button type="submit" class="w-full rounded-lg bg-cyan-600 py-2.5 text-sm font-semibold text-white shadow-lg shadow-cyan-950/25 transition hover:bg-cyan-500">Sign in</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>"""
+
+    async def login_page(self):
+        if request.method == "GET":
+            if session.get("admin"):
+                return redirect("/")
+            rec = self._load_admin_record()
+            if not rec:
+                return self._render_login_page(
+                    notice="No admin account yet. From this folder run: python admin.py"
+                )
+            return self._render_login_page()
+        form = await request.form
+        username = (form.get("username") or "").strip()
+        password = form.get("password") or ""
+        rec = self._load_admin_record()
+        if not rec:
+            return self._render_login_page(error="Admin is not configured. Run python admin.py"), 200
+        if username != rec.get("username") or not check_password_hash(rec["password_hash"], password):
+            return self._render_login_page(error="Invalid username or password"), 200
+        session.clear()
+        session["admin"] = True
+        return redirect("/")
+
+    async def logout(self):
+        session.pop("admin", None)
+        return redirect("/login")
+
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
+        self.app.route("/login", methods=["GET", "POST"])(self.login_page)
+        self.app.route("/logout", methods=["POST"])(self.logout)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/createTask', methods=['POST'])(self.create_task_api)
@@ -317,10 +503,11 @@ class TurnstileAPIServer:
 
     async def _launch_browser_instance(self):
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
+            launch_args = list(self.browser_args) + list(_CHROMIUM_LOW_RESOURCE_ARGS)
             return await self.playwright.chromium.launch(
                 channel=self.browser_type,
                 headless=self.headless,
-                args=self.browser_args
+                args=launch_args
             )
         if self.browser_type == "camoufox":
             return await self.camoufox.start()
@@ -350,11 +537,7 @@ class TurnstileAPIServer:
                     else:
                         raise ValueError("Invalid proxy format")
                 elif self.proxy_support:
-                    proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
-                    with open(proxy_file_path) as proxy_file:
-                        proxies = [line.strip() for line in proxy_file if line.strip()]
-
+                    proxies = self._get_proxies_list_cached()
                     selected_proxy = random.choice(proxies) if proxies else None
 
                     if selected_proxy:
@@ -455,7 +638,7 @@ class TurnstileAPIServer:
                             logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{turnstile_check[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
 
                             self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
-                            self._save_results()
+                            await self._request_debounced_results_save()
                             if client_key:
                                 self._increment_usage(client_key)
                             break
@@ -543,6 +726,9 @@ class TurnstileAPIServer:
 
     async def generate_key_api(self):
         """Generate a new API key and save it."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         user_name = (data.get("userName") or "").strip()
         expiry_date = (data.get("expiryDate") or "").strip()
@@ -561,6 +747,9 @@ class TurnstileAPIServer:
 
     async def remove_key_api(self):
         """Remove an API key and its usage record."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         key = (data.get("key") or "").strip()
 
@@ -583,6 +772,9 @@ class TurnstileAPIServer:
 
     async def toggle_key_api(self):
         """Enable or disable an API key."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         key = (data.get("key") or "").strip()
         enabled = data.get("enabled")
@@ -604,6 +796,9 @@ class TurnstileAPIServer:
 
     async def update_key_expiry_api(self):
         """Update expiry date for an API key."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         key = (data.get("key") or "").strip()
         expiry_date = (data.get("expiryDate") or "").strip()
@@ -626,6 +821,9 @@ class TurnstileAPIServer:
 
     async def get_usage_api(self):
         """Return usage statistics for all API keys."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         return jsonify({"success": True, "usage": self.usage, "keys": self.api_keys, "records": self._api_key_rows()})
 
     async def create_task_api(self):
@@ -732,6 +930,9 @@ class TurnstileAPIServer:
         return jsonify({"errorId": 1, "errorCode": "ERROR_UNKNOWN", "errorDescription": "Unknown state"}), 500
 
     async def get_shelf_status_api(self):
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         async with self.shelf_lock:
             for k in list(self.shelf.keys()):
                 self._prune_shelf_key(k)
@@ -749,6 +950,9 @@ class TurnstileAPIServer:
         })
 
     async def set_shelf_settings_api(self):
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         if "maxAgeSeconds" in data and data["maxAgeSeconds"] is not None:
             try:
@@ -772,6 +976,9 @@ class TurnstileAPIServer:
         return jsonify({"success": True})
 
     async def shelf_control_api(self):
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         run = data.get("running")
         if run is True:
@@ -838,6 +1045,9 @@ class TurnstileAPIServer:
 
     async def toggle_multi_thread_api(self):
         """Toggle multi-threading on or off."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json()
         enable = data.get('enable', False)
         
@@ -853,6 +1063,9 @@ class TurnstileAPIServer:
 
     async def get_multi_thread_status_api(self):
         """Get current multi-thread status."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         return jsonify({
             "success": True,
             "multi_thread": self.multi_thread,
@@ -863,6 +1076,9 @@ class TurnstileAPIServer:
 
     async def set_thread_count_api(self):
         """Update the browser quantity used when multi-thread mode is ON."""
+        auth = self._require_admin_session()
+        if auth is not None:
+            return auth
         data = await request.get_json(silent=True) or {}
         try:
             requested = int(data.get("threadCount", self.thread_count))
@@ -911,9 +1127,10 @@ class TurnstileAPIServer:
                     
             logger.success(f"Browser pool adjusted. Current browsers: {self.current_browser_count}")
 
-    @staticmethod
-    async def index():
-        """Serve the API documentation page."""
+    async def index(self):
+        """Serve the API documentation page (requires admin login)."""
+        if not session.get("admin"):
+            return redirect("/login")
         html = (
             """
             <!DOCTYPE html>
@@ -921,73 +1138,98 @@ class TurnstileAPIServer:
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Turnstile Solver API</title>
-                <script async src="https://cdn.tailwindcss.com"></script>
+                <title>Cloudflare Turnstile Solver API</title>
+                <link rel="preconnect" href="https://fonts.googleapis.com">
+                <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+                <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
+                <script src="https://cdn.tailwindcss.com"></script>
+                <script>
+                    tailwind.config = {
+                        theme: {
+                            extend: {
+                                fontFamily: { sans: ['DM Sans', 'system-ui', 'sans-serif'] },
+                            },
+                        },
+                    };
+                </script>
             </head>
-            <body class="bg-gray-900 text-gray-200 min-h-screen flex flex-col items-center justify-center py-10 px-2 sm:px-4">
-                <div class="bg-gray-800 p-6 sm:p-8 rounded-lg shadow-md w-full border border-red-500" style="max-width:96vw;">
-                    <h1 class="text-3xl font-bold mb-6 text-center text-red-500">Multi Tool Turnstile Solution</h1>
-
-                    <section class="mb-8 border border-gray-600 rounded-lg p-5 bg-gray-900/40">
-                        <div class="flex justify-between items-center mb-4">
+            <body class="min-h-screen bg-zinc-950 text-zinc-300 antialiased font-sans selection:bg-cyan-500/25 selection:text-white">
+                <div class="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_100%_60%_at_50%_-20%,rgba(34,211,238,0.07),transparent_55%)]"></div>
+                <div class="relative">
+                    <header class="sticky top-0 z-30 border-b border-zinc-800/80 bg-zinc-950/85 backdrop-blur-md">
+                        <div class="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-4 sm:px-6">
                             <div>
-                                <h2 class="text-xl font-semibold text-red-400 mb-1">API Key Management</h2>
-                                <p class="text-sm text-gray-400">Generate API keys for users with optional expiry date.</p>
+                                <p class="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500">Cloudflare Turnstile solver</p>
+                                <h1 class="text-lg font-semibold tracking-tight text-white sm:text-xl">Control panel</h1>
                             </div>
-                            <button id="generate-key-btn" type="button" class="px-4 py-2 rounded bg-red-600 hover:bg-red-500 text-white font-semibold shadow text-sm">
+                            <div class="flex shrink-0 items-center gap-2">
+                                <span class="hidden rounded-full border border-zinc-800 bg-zinc-900/80 px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider text-zinc-500 sm:inline">Local</span>
+                                <button type="button" id="logout-btn" class="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-700">Log out</button>
+                            </div>
+                        </div>
+                    </header>
+                    <main class="mx-auto max-w-5xl space-y-6 px-4 py-8 sm:px-6 sm:py-10">
+
+                    <section class="rounded-2xl border border-zinc-800/70 bg-zinc-900/40 p-5 shadow-xl shadow-black/20 sm:p-6">
+                        <div class="mb-4 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                            <div>
+                                <h2 class="text-lg font-semibold text-white tracking-tight mb-1">API Key Management</h2>
+                                <p class="text-sm text-zinc-500">Generate API keys for users with optional expiry date.</p>
+                            </div>
+                            <button id="generate-key-btn" type="button" class="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-cyan-950/25 transition hover:bg-cyan-500">
                                 Generate New Key
                             </button>
                         </div>
-                        <div id="api-key-result" class="hidden mt-3 p-3 bg-gray-950 border border-red-800 rounded">
-                            <p class="text-sm text-gray-400 mb-1">New API Key (Save this!):</p>
+                        <div id="api-key-result" class="mt-3 hidden rounded-xl border border-emerald-500/25 bg-emerald-950/20 p-3">
+                            <p class="text-sm text-zinc-500 mb-1">New API Key (Save this!):</p>
                             <div class="flex items-center gap-2">
-                                <input type="text" id="new-api-key" readonly class="flex-1 px-3 py-2 rounded bg-gray-900 border border-gray-700 text-green-400 font-mono text-sm" />
-                                <button type="button" id="copy-key-btn" class="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white text-sm">Copy</button>
+                                <input type="text" id="new-api-key" readonly class="flex-1 rounded-lg border border-zinc-800 bg-zinc-950/80 px-3 py-2 font-mono text-sm text-emerald-400" />
+                                <button type="button" id="copy-key-btn" class="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700 text-white text-sm">Copy</button>
                             </div>
                         </div>
                     </section>
 
-                    <div id="generate-key-modal" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/70 px-4" style="display:none;">
-                        <div class="bg-gray-800 border border-red-700 rounded-lg shadow-xl w-full max-w-lg p-6">
+                    <div id="generate-key-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/60 px-4 backdrop-blur-sm" style="display:none;">
+                        <div class="w-full max-w-lg rounded-2xl border border-zinc-800/90 bg-zinc-900 p-6 shadow-2xl shadow-black/40">
                             <div class="flex items-start justify-between gap-4 mb-4">
                                 <div>
-                                    <h2 class="text-xl font-semibold text-red-400 mb-1">Generate New API Key</h2>
-                                    <p class="text-sm text-gray-400">Enter user details before creating the key.</p>
+                                    <h2 class="text-lg font-semibold text-white tracking-tight mb-1">Generate New API Key</h2>
+                                    <p class="text-sm text-zinc-500">Enter user details before creating the key.</p>
                                 </div>
-                                <button id="close-generate-key-modal" type="button" class="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
+                                <button id="close-generate-key-modal" type="button" class="text-zinc-500 hover:text-white text-2xl leading-none">&times;</button>
                             </div>
                             <div class="space-y-4">
                                 <div>
-                                    <label for="api-user-name" class="block text-sm font-medium text-gray-300 mb-1">User Name</label>
+                                    <label for="api-user-name" class="block text-sm font-medium text-zinc-400 mb-1">User Name</label>
                                     <input id="api-user-name" type="text" placeholder="Customer / user name" autocomplete="off"
-                                        class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500" />
+                                        class="w-full px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-cyan-500/40" />
                                 </div>
                                 <div>
-                                    <label for="api-expiry-date" class="block text-sm font-medium text-gray-300 mb-1">Expiry Date <span class="text-gray-500 font-normal">(optional)</span></label>
+                                    <label for="api-expiry-date" class="block text-sm font-medium text-zinc-400 mb-1">Expiry Date <span class="text-zinc-600 font-normal">(optional)</span></label>
                                     <input id="api-expiry-date" type="date"
-                                        class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 focus:outline-none focus:ring-2 focus:ring-red-500" />
+                                        class="w-full px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/40" />
                                 </div>
                             </div>
                             <div class="mt-6 flex justify-end gap-3">
-                                <button id="cancel-generate-key-btn" type="button" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-semibold text-sm">Cancel</button>
-                                <button id="confirm-generate-key-btn" type="button" class="px-4 py-2 rounded bg-red-600 hover:bg-red-500 text-white font-semibold text-sm">Generate Key</button>
+                                <button id="cancel-generate-key-btn" type="button" class="px-4 py-2 rounded bg-zinc-800 hover:bg-zinc-700 text-white font-semibold text-sm">Cancel</button>
+                                <button id="confirm-generate-key-btn" type="button" class="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-cyan-950/25 transition hover:bg-cyan-500">Generate Key</button>
                             </div>
                         </div>
                     </div>
 
-                    <section class="mb-8 border border-gray-600 rounded-lg p-5 bg-gray-900/40">
-                        <div class="flex justify-between items-center mb-4">
+                    <section class="rounded-2xl border border-zinc-800/70 bg-zinc-900/40 p-5 shadow-xl shadow-black/20 sm:p-6">
+                        <div class="mb-4 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                             <div>
-                                <h2 class="text-xl font-semibold text-red-400 mb-1">API Key Usage Stats</h2>
-                                <p class="text-sm text-gray-400">Track how many tokens each API key has generated.</p>
+                                <h2 class="text-lg font-semibold text-white tracking-tight mb-1">API Key Usage Stats</h2>
+                                <p class="text-sm text-zinc-500">Track how many tokens each API key has generated.</p>
                             </div>
-                            <button id="refresh-usage-btn" type="button" class="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs shadow">
+                            <button id="refresh-usage-btn" type="button" class="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-white text-xs shadow">
                                 Refresh
                             </button>
                         </div>
                         <div class="overflow-x-auto">
-                            <table class="w-full text-left text-sm text-gray-300 border-collapse">
-                                <thead class="bg-gray-800 text-gray-400 border-b border-gray-700">
+                            <table class="w-full text-left text-sm text-zinc-400 border-collapse">
+                                <thead class="bg-zinc-900 text-zinc-500 border-b border-zinc-800">
                                     <tr>
                                         <th class="px-4 py-3 font-medium rounded-tl">User Name</th>
                                         <th class="px-4 py-3 font-medium">API Key</th>
@@ -997,127 +1239,88 @@ class TurnstileAPIServer:
                                         <th class="px-4 py-3 font-medium rounded-tr">Action</th>
                                     </tr>
                                 </thead>
-                                <tbody id="usage-tbody" class="divide-y divide-gray-700">
-                                    <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tbody id="usage-tbody" class="divide-y divide-zinc-800">
+                                    <tr><td colspan="6" class="px-4 py-4 text-center text-zinc-600">Loading...</td></tr>
                                 </tbody>
                             </table>
                         </div>
                     </section>
 
-                    <section class="mb-8 border border-gray-600 rounded-lg p-5 bg-gray-900/40">
-                        <div class="flex justify-between items-center mb-4">
+                    <section class="rounded-2xl border border-zinc-800/70 bg-zinc-900/40 p-5 shadow-xl shadow-black/20 sm:p-6">
+                        <div class="mb-4 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                             <div>
-                                <h2 class="text-xl font-semibold text-red-400 mb-1">Multi-Thread Mode</h2>
-                                <p class="text-sm text-gray-400">Toggle multi-threading to save PC resources. When OFF, only 1 browser is used. When ON, it uses the browser quantity below.</p>
+                                <h2 class="text-lg font-semibold text-white tracking-tight mb-1">Multi-Thread Mode</h2>
+                                <p class="text-sm text-zinc-500">Toggle multi-threading to save PC resources. When OFF, only 1 browser is used. When ON, it uses the browser quantity below.</p>
                             </div>
                             <div class="flex flex-wrap items-center gap-3">
-                                <label for="browser-quantity" class="text-sm text-gray-300">Browsers</label>
+                                <label for="browser-quantity" class="text-sm text-zinc-400">Browsers</label>
                                 <input id="browser-quantity" type="number" min="1" step="1" value="15" autocomplete="off"
-                                    class="w-24 px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 focus:outline-none focus:ring-2 focus:ring-red-500" />
-                                <button id="apply-thread-count-btn" type="button" class="px-3 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-semibold shadow text-sm">
+                                    class="w-24 px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/40" />
+                                <button id="apply-thread-count-btn" type="button" class="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700 text-white font-semibold shadow text-sm">
                                     Apply
                                 </button>
-                                <span id="thread-status-text" class="text-sm font-medium text-gray-300">Loading...</span>
-                                <button id="toggle-thread-btn" type="button" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-semibold shadow text-sm transition-colors" style="display:none;">
+                                <span id="thread-status-text" class="text-sm font-medium text-zinc-400">Loading...</span>
+                                <button id="toggle-thread-btn" type="button" class="px-4 py-2 rounded bg-zinc-800 hover:bg-zinc-700 text-white font-semibold shadow text-sm transition-colors" style="display:none;">
                                     Toggle
                                 </button>
                             </div>
                         </div>
                     </section>
 
-                    <section class="mb-8 border border-gray-600 rounded-lg p-5 bg-gray-900/40">
-                        <h2 class="text-xl font-semibold text-red-400 mb-1">Token shelf (prefill)</h2>
-                        <p class="text-sm text-gray-400 mb-4">Background solving fills a shelf. <code class="text-red-400">createTask</code> returns instantly when a fresh token matches URL, site key, action, and cdata. Tokens older than max age are dropped.</p>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
-                            <div>
-                                <label for="shelf-max-age" class="block text-sm font-medium text-gray-300 mb-1">Max token age (seconds)</label>
-                                <input id="shelf-max-age" type="number" min="1" step="1" value="50" autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 focus:outline-none focus:ring-2 focus:ring-red-500" />
-                            </div>
-                            <div class="flex items-end gap-2">
-                                <button id="shelf-apply-btn" type="button" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-semibold text-sm">Apply settings</button>
-                                <span id="shelf-status-text" class="text-sm text-gray-400 pb-2">Loading...</span>
-                            </div>
-                            <div class="md:col-span-2">
-                                <label for="shelf-prefill-url" class="block text-sm font-medium text-gray-300 mb-1">Prefill website URL</label>
-                                <input id="shelf-prefill-url" type="text" inputmode="url" placeholder="https://..." autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 focus:outline-none focus:ring-2 focus:ring-red-500" />
-                            </div>
-                            <div class="md:col-span-2">
-                                <label for="shelf-prefill-sitekey" class="block text-sm font-medium text-gray-300 mb-1">Prefill site key</label>
-                                <input id="shelf-prefill-sitekey" type="text" placeholder="0x4AAAAAA..." autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-red-500" />
-                            </div>
-                            <div>
-                                <label for="shelf-prefill-action" class="block text-sm font-medium text-gray-300 mb-1">Action <span class="text-gray-500 font-normal">(optional)</span></label>
-                                <input id="shelf-prefill-action" type="text" placeholder="login" autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-red-500" />
-                            </div>
-                            <div>
-                                <label for="shelf-prefill-cdata" class="block text-sm font-medium text-gray-300 mb-1">cdata <span class="text-gray-500 font-normal">(optional)</span></label>
-                                <input id="shelf-prefill-cdata" type="text" autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-red-500" />
-                            </div>
-                        </div>
-                        <div class="flex flex-wrap items-center gap-3">
-                            <button id="shelf-start-btn" type="button" class="px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-semibold text-sm">Start</button>
-                            <button id="shelf-stop-btn" type="button" class="px-4 py-2 rounded bg-red-600 hover:bg-red-500 text-white font-semibold text-sm">Stop</button>
-                        </div>
-                    </section>
-
-                    <section class="mb-8 border border-gray-600 rounded-lg p-5 bg-gray-900/40">
-                        <h2 class="text-xl font-semibold text-red-400 mb-1">Live test solve</h2>
-                        <p class="text-sm text-gray-400 mb-4">Use the real page origin and Turnstile sitekey from that site. The solver opens this URL in a browser and runs the widget there.</p>
+                    <section class="rounded-2xl border border-zinc-800/70 bg-zinc-900/40 p-5 shadow-xl shadow-black/20 sm:p-6">
+                        <h2 class="text-lg font-semibold text-white tracking-tight mb-1">Live test solve</h2>
+                        <p class="text-sm text-zinc-500 mb-4">Use the real page origin and Turnstile sitekey from that site. The solver opens this URL in a browser and runs the widget there.</p>
                         <div class="space-y-3">
                             <div>
-                                <label for="test-url" class="block text-sm font-medium text-gray-300 mb-1">Website URL</label>
+                                <label for="test-url" class="block text-sm font-medium text-zinc-400 mb-1">Website URL</label>
                                 <input id="test-url" type="text" inputmode="url" value="__IVAC_SIGNIN_URL__" placeholder="https://your-domain.com" autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500" />
+                                    class="w-full px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-cyan-500/40" />
                             </div>
                             <div>
-                                <label for="test-sitekey" class="block text-sm font-medium text-gray-300 mb-1">Site key</label>
+                                <label for="test-sitekey" class="block text-sm font-medium text-zinc-400 mb-1">Site key</label>
                                 <input id="test-sitekey" type="text" value="__IVAC_SITEKEY__" placeholder="0x4AAAAAA..." autocomplete="off"
-                                    class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500 font-mono text-sm" />
+                                    class="w-full px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 font-mono text-sm" />
                             </div>
                             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                 <div>
-                                    <label for="test-action" class="block text-sm font-medium text-gray-300 mb-1">Action <span class="text-gray-500 font-normal">(optional)</span></label>
+                                    <label for="test-action" class="block text-sm font-medium text-zinc-400 mb-1">Action <span class="text-zinc-600 font-normal">(optional)</span></label>
                                     <input id="test-action" type="text" placeholder="login" autocomplete="off"
-                                        class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm" />
+                                        class="w-full px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 text-sm" />
                                 </div>
                                 <div>
-                                    <label for="test-ua" class="block text-sm font-medium text-gray-300 mb-1">User-Agent <span class="text-gray-500 font-normal">(optional)</span></label>
+                                    <label for="test-ua" class="block text-sm font-medium text-zinc-400 mb-1">User-Agent <span class="text-zinc-600 font-normal">(optional)</span></label>
                                     <input id="test-ua" type="text" placeholder="Mozilla/5.0 ..." autocomplete="off"
-                                        class="w-full px-3 py-2 rounded bg-gray-900 border border-gray-600 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500 text-sm" />
+                                        class="w-full px-3 py-2 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 text-sm" />
                                 </div>
                             </div>
                         </div>
                         <div class="mt-4 flex flex-wrap items-center gap-3">
                             <button id="test-solve-btn" type="button"
-                                class="px-5 py-2.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-semibold shadow disabled:opacity-50 disabled:cursor-not-allowed">
+                                class="rounded-lg bg-cyan-600 px-5 py-2.5 font-semibold text-white shadow-lg shadow-cyan-950/25 transition hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-50">
                                 Test solve
                             </button>
-                            <span id="test-status" class="text-sm text-gray-400"></span>
+                            <span id="test-status" class="text-sm text-zinc-500"></span>
                         </div>
-                        <div id="test-error" class="hidden mt-3 text-sm text-red-300 bg-red-950/50 border border-red-800 rounded p-3" style="display:none"></div>
+                        <div id="test-error" class="mt-3 hidden rounded-xl border border-rose-500/30 bg-rose-950/30 p-3 text-sm text-rose-200" style="display:none"></div>
                         <div id="test-result-wrap" class="hidden mt-4" style="display:none">
-                            <p class="text-sm text-gray-400 mb-1">Token <span id="test-elapsed" class="text-green-400"></span></p>
+                            <p class="text-sm text-zinc-500 mb-1">Token <span id="test-elapsed" class="font-medium text-emerald-400"></span></p>
                             <textarea id="test-token" readonly rows="4"
-                                class="w-full px-3 py-2 rounded bg-gray-950 border border-gray-700 text-green-300 font-mono text-xs break-all"></textarea>
-                            <button type="button" id="copy-token-btn" class="mt-2 text-sm text-red-400 hover:underline">Copy token</button>
+                                class="w-full break-all rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs text-emerald-300"></textarea>
+                            <button type="button" id="copy-token-btn" class="mt-2 text-sm font-medium text-cyan-400 hover:text-cyan-300">Copy token</button>
                         </div>
                     </section>
 
-                    <section class="mb-8 border border-gray-600 rounded-lg p-5 bg-gray-900/40">
-                        <h2 class="text-xl font-semibold text-red-400 mb-4">API Documentation</h2>
-                        
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <section class="rounded-2xl border border-zinc-800/70 bg-zinc-900/40 p-5 shadow-xl shadow-black/20 sm:p-6">
+                        <h2 class="text-lg font-semibold text-white tracking-tight mb-4">API Documentation</h2>
+
+                        <ol class="ml-0 list-decimal space-y-6 pl-6 marker:font-semibold marker:text-cyan-500/90">
+                            <li class="pl-2">
                             <!-- createTask -->
-                            <div class="bg-gray-950 p-4 rounded border border-gray-700 relative group">
-                                <h3 class="text-lg font-medium text-gray-200 mb-2">1. Create Task</h3>
-                                <p class="text-sm text-gray-400 mb-2"><strong>POST</strong> <code class="text-red-400">/createTask</code></p>
-                                <button type="button" class="copy-json-btn absolute top-4 right-4 px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded border border-gray-600 transition-colors">Copy</button>
-                                <pre class="text-xs text-green-400 bg-black p-3 rounded overflow-x-auto"><code class="json-content">{
+                            <div class="group relative rounded-xl border border-zinc-800/80 bg-zinc-950/50 p-4 sm:p-5">
+                                <h3 class="text-lg font-medium text-zinc-100 mb-2">Create Task</h3>
+                                <p class="text-sm text-zinc-500 mb-2"><strong class="text-zinc-300">POST</strong> <code class="font-mono text-cyan-400">/createTask</code></p>
+                                <button type="button" class="copy-json-btn absolute right-4 top-4 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-400 transition hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-200">Copy</button>
+                                <pre class="overflow-x-auto rounded-lg bg-zinc-950 p-3 text-xs text-emerald-300"><code class="json-content">{
   "clientKey": "MT-YOUR_API_KEY",
   "task": {
     "type": "TurnstileTaskProxyless",
@@ -1127,23 +1330,26 @@ class TurnstileAPIServer:
   }
 }</code></pre>
                             </div>
+                            </li>
 
+                            <li class="pl-2">
                             <!-- getTaskResult -->
-                            <div class="bg-gray-950 p-4 rounded border border-gray-700 relative group">
-                                <h3 class="text-lg font-medium text-gray-200 mb-2">2. Get Task Result</h3>
-                                <p class="text-sm text-gray-400 mb-2"><strong>POST</strong> <code class="text-red-400">/getTaskResult</code></p>
-                                <button type="button" class="copy-json-btn absolute top-4 right-4 px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs rounded border border-gray-600 transition-colors">Copy</button>
-                                <pre class="text-xs text-green-400 bg-black p-3 rounded overflow-x-auto"><code class="json-content">{
+                            <div class="group relative rounded-xl border border-zinc-800/80 bg-zinc-950/50 p-4 sm:p-5">
+                                <h3 class="text-lg font-medium text-zinc-100 mb-2">Get Task Result</h3>
+                                <p class="text-sm text-zinc-500 mb-2"><strong class="text-zinc-300">POST</strong> <code class="font-mono text-cyan-400">/getTaskResult</code></p>
+                                <button type="button" class="copy-json-btn absolute right-4 top-4 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-400 transition hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-200">Copy</button>
+                                <pre class="overflow-x-auto rounded-lg bg-zinc-950 p-3 text-xs text-emerald-300"><code class="json-content">{
   "clientKey": "MT-YOUR_API_KEY",
   "taskId": "TASK_ID_FROM_CREATE_TASK"
 }</code></pre>
                             </div>
-                        </div>
+                            </li>
+                        </ol>
                     </section>
-                </div>
-                
-                <div class="text-center text-gray-500 text-sm mt-8 mb-4">
-                    &copy; 2026 Multi Tool. All rights reserved.
+                    </main>
+                    <footer class="border-t border-zinc-800/80 py-8 text-center text-xs text-zinc-600">
+                        &copy; 2026 Multi Tool. All rights reserved.
+                    </footer>
                 </div>
                 <script>
                 (function () {
@@ -1156,6 +1362,14 @@ class TurnstileAPIServer:
                             el.classList.remove('hidden');
                             el.style.display = '';
                         }
+                    }
+
+                    function redirectIfUnauthorized(res) {
+                        if (res.status === 401) {
+                            window.location.href = '/login';
+                            return true;
+                        }
+                        return false;
                     }
 
                     function parseResultBody(text) {
@@ -1362,6 +1576,7 @@ class TurnstileAPIServer:
                                             expiryDate: apiExpiryDateInput ? apiExpiryDateInput.value : ''
                                         })
                                     });
+                                    if (redirectIfUnauthorized(res)) return;
                                     var data = await res.json();
                                     if (data.key) {
                                         newKeyInput.value = data.key;
@@ -1394,6 +1609,7 @@ class TurnstileAPIServer:
                             if (!tbody) return;
                             try {
                                 var res = await fetch('/getUsage', { cache: 'no-store' });
+                                if (redirectIfUnauthorized(res)) return;
                                 var data = await res.json();
                                 if (data.success && (data.records || data.keys)) {
                                     tbody.innerHTML = '';
@@ -1401,7 +1617,7 @@ class TurnstileAPIServer:
                                         return { key: k, userName: '', expiryDate: '', enabled: true, expired: false, usage: data.usage[k] || 0 };
                                     });
                                     if (records.length === 0) {
-                                        tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">No API keys found.</td></tr>';
+                                        tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-4 text-center text-zinc-600">No API keys found.</td></tr>';
                                         return;
                                     }
                                     records.forEach(function(record) {
@@ -1410,14 +1626,14 @@ class TurnstileAPIServer:
                                         var expired = !!record.expired;
                                         var enabled = !!record.enabled && !expired;
                                         var tr = document.createElement('tr');
-                                        tr.className = 'hover:bg-gray-800/50';
+                                        tr.className = 'hover:bg-zinc-800/50';
 
                                         var userTd = document.createElement('td');
-                                        userTd.className = 'px-4 py-3 text-sm text-gray-200';
+                                        userTd.className = 'px-4 py-3 text-sm text-zinc-100';
                                         userTd.textContent = record.userName || '-';
 
                                         var keyTd = document.createElement('td');
-                                        keyTd.className = 'px-4 py-3 font-mono text-xs text-green-400';
+                                        keyTd.className = 'px-4 py-3 font-mono text-xs text-emerald-400/90';
                                         keyTd.textContent = key;
 
                                         var countTd = document.createElement('td');
@@ -1430,12 +1646,12 @@ class TurnstileAPIServer:
                                         expiryWrap.className = 'flex flex-wrap items-center gap-2';
                                         var expiryInput = document.createElement('input');
                                         expiryInput.type = 'date';
-                                        expiryInput.className = 'expiry-date-input px-2 py-1 rounded bg-gray-900 border border-gray-600 text-gray-100 text-xs focus:outline-none focus:ring-1 focus:ring-red-500';
+                                        expiryInput.className = 'expiry-date-input px-2 py-1 rounded bg-zinc-950/80 border border-zinc-800 text-zinc-100 text-xs focus:outline-none focus:ring-1 focus:ring-cyan-500/30';
                                         expiryInput.value = record.expiryDate || '';
                                         expiryInput.setAttribute('data-key', key);
                                         var updateExpiryBtn = document.createElement('button');
                                         updateExpiryBtn.type = 'button';
-                                        updateExpiryBtn.className = 'update-expiry-btn px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs font-semibold';
+                                        updateExpiryBtn.className = 'update-expiry-btn px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-white text-xs font-semibold';
                                         updateExpiryBtn.textContent = 'Update';
                                         updateExpiryBtn.setAttribute('data-key', key);
                                         expiryWrap.appendChild(expiryInput);
@@ -1445,13 +1661,13 @@ class TurnstileAPIServer:
                                         var statusTd = document.createElement('td');
                                         statusTd.className = 'px-4 py-3 text-sm font-semibold';
                                         if (expired) {
-                                            statusTd.className += ' text-yellow-400';
+                                            statusTd.className += ' text-amber-400';
                                             statusTd.textContent = 'Expired';
                                         } else if (enabled) {
-                                            statusTd.className += ' text-green-400';
+                                            statusTd.className += ' text-emerald-400';
                                             statusTd.textContent = 'Enabled';
                                         } else {
-                                            statusTd.className += ' text-red-400';
+                                            statusTd.className += ' text-rose-400';
                                             statusTd.textContent = 'Disabled';
                                         }
 
@@ -1459,17 +1675,17 @@ class TurnstileAPIServer:
                                         actionTd.className = 'px-4 py-3 flex flex-wrap gap-2';
                                         var toggleBtn = document.createElement('button');
                                         toggleBtn.type = 'button';
-                                        toggleBtn.className = (enabled ? 'disable-api-key-btn bg-yellow-700 hover:bg-yellow-600' : 'enable-api-key-btn bg-green-700 hover:bg-green-600') + ' px-3 py-1.5 rounded text-white text-xs font-semibold';
+                                        toggleBtn.className = (enabled ? 'disable-api-key-btn bg-amber-600 hover:bg-amber-500' : 'enable-api-key-btn bg-emerald-600 hover:bg-emerald-500') + ' rounded-md px-3 py-1.5 text-xs font-semibold text-white transition';
                                         toggleBtn.textContent = enabled ? 'Disable' : 'Enable';
                                         toggleBtn.setAttribute('data-key', key);
                                         toggleBtn.setAttribute('data-enabled', enabled ? 'false' : 'true');
                                         if (expired) {
                                             toggleBtn.disabled = true;
-                                            toggleBtn.className = 'px-3 py-1.5 rounded bg-gray-700 text-gray-400 text-xs font-semibold cursor-not-allowed';
+                                            toggleBtn.className = 'cursor-not-allowed rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-semibold text-zinc-500';
                                         }
                                         var removeBtn = document.createElement('button');
                                         removeBtn.type = 'button';
-                                        removeBtn.className = 'remove-api-key-btn px-3 py-1.5 rounded bg-red-700 hover:bg-red-600 text-white text-xs font-semibold';
+                                        removeBtn.className = 'remove-api-key-btn rounded-md bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500';
                                         removeBtn.textContent = 'Remove';
                                         removeBtn.setAttribute('data-key', key);
                                         actionTd.appendChild(toggleBtn);
@@ -1485,7 +1701,7 @@ class TurnstileAPIServer:
                                     });
                                 }
                             } catch (e) {
-                                tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-4 text-center text-red-400">Failed to load usage stats.</td></tr>';
+                                tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-4 text-center text-rose-400">Failed to load usage stats.</td></tr>';
                             }
                         }
 
@@ -1506,6 +1722,7 @@ class TurnstileAPIServer:
                                             headers: { 'Content-Type': 'application/json' },
                                             body: JSON.stringify({ key: expiryKey, expiryDate: expiryInput.value })
                                         });
+                                        if (redirectIfUnauthorized(expiryRes)) return;
                                         var expiryData = await expiryRes.json();
                                         if (!expiryData.success) {
                                             alert(expiryData.error || 'Failed to update expiry');
@@ -1532,6 +1749,7 @@ class TurnstileAPIServer:
                                             headers: { 'Content-Type': 'application/json' },
                                             body: JSON.stringify({ key: toggleKey, enabled: shouldEnable })
                                         });
+                                        if (redirectIfUnauthorized(toggleRes)) return;
                                         var toggleData = await toggleRes.json();
                                         if (!toggleData.success) {
                                             alert(toggleData.error || 'Failed to update API key');
@@ -1562,6 +1780,7 @@ class TurnstileAPIServer:
                                         headers: { 'Content-Type': 'application/json' },
                                         body: JSON.stringify({ key: key })
                                     });
+                                    if (redirectIfUnauthorized(res)) return;
                                     var data = await res.json();
                                     if (!data.success) {
                                         alert(data.error || 'Failed to remove API key');
@@ -1592,6 +1811,7 @@ class TurnstileAPIServer:
                         async function fetchThreadStatus() {
                             try {
                                 var res = await fetch('/getMultiThreadStatus', { cache: 'no-store' });
+                                if (redirectIfUnauthorized(res)) return;
                                 var data = await res.json();
                                 if (data.success) {
                                     isMultiThread = data.multi_thread;
@@ -1615,13 +1835,13 @@ class TurnstileAPIServer:
                             
                             toggleThreadBtn.style.display = '';
                             if (isMultiThread) {
-                                threadStatusText.innerHTML = '<span class="text-green-400">ON</span> (' + data.current_browsers + '/' + data.max_threads + ' browsers)';
+                                threadStatusText.innerHTML = '<span class="font-medium text-emerald-400">ON</span> <span class="text-zinc-500">(' + data.current_browsers + '/' + data.max_threads + ' browsers)</span>';
                                 toggleThreadBtn.textContent = 'Turn OFF';
-                                toggleThreadBtn.className = 'px-4 py-2 rounded bg-red-600 hover:bg-red-500 text-white font-semibold shadow text-sm transition-colors';
+                                toggleThreadBtn.className = 'rounded-lg bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-rose-950/20 transition hover:bg-rose-500';
                             } else {
-                                threadStatusText.innerHTML = '<span class="text-gray-400">OFF</span> (' + data.current_browsers + '/' + data.max_threads + ' browsers)';
+                                threadStatusText.innerHTML = '<span class="font-medium text-zinc-500">OFF</span> <span class="text-zinc-600">(' + data.current_browsers + '/' + data.max_threads + ' browsers)</span>';
                                 toggleThreadBtn.textContent = 'Turn ON';
-                                toggleThreadBtn.className = 'px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-semibold shadow text-sm transition-colors';
+                                toggleThreadBtn.className = 'rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-emerald-950/20 transition hover:bg-emerald-500';
                             }
                         }
 
@@ -1635,6 +1855,7 @@ class TurnstileAPIServer:
                                         headers: { 'Content-Type': 'application/json' },
                                         body: JSON.stringify({ threadCount: count })
                                     });
+                                    if (redirectIfUnauthorized(res)) return;
                                     var data = await res.json();
                                     if (!data.success) {
                                         alert(data.error || 'Failed to update browser quantity');
@@ -1660,6 +1881,7 @@ class TurnstileAPIServer:
                                         headers: { 'Content-Type': 'application/json' },
                                         body: JSON.stringify({ enable: !isMultiThread })
                                     });
+                                    if (redirectIfUnauthorized(res)) return;
                                     var data = await res.json();
                                     if (data.success) {
                                         isMultiThread = data.multi_thread;
@@ -1677,109 +1899,15 @@ class TurnstileAPIServer:
                         
                         fetchThreadStatus();
 
-                        var shelfMaxAge = document.getElementById('shelf-max-age');
-                        var shelfPrefillUrl = document.getElementById('shelf-prefill-url');
-                        var shelfPrefillSk = document.getElementById('shelf-prefill-sitekey');
-                        var shelfPrefillAction = document.getElementById('shelf-prefill-action');
-                        var shelfPrefillCdata = document.getElementById('shelf-prefill-cdata');
-                        var shelfApplyBtn = document.getElementById('shelf-apply-btn');
-                        var shelfStartBtn = document.getElementById('shelf-start-btn');
-                        var shelfStopBtn = document.getElementById('shelf-stop-btn');
-                        var shelfStatusText = document.getElementById('shelf-status-text');
-
-                        async function fetchShelfStatus() {
-                            if (!shelfStatusText) return;
-                            try {
-                                var res = await fetch('/getShelfStatus', { cache: 'no-store' });
-                                var data = await res.json();
-                                if (data.success) {
-                                    if (shelfMaxAge) { shelfMaxAge.value = String(Math.floor(Number(data.maxAgeSeconds) || 50)); }
-                                    if (shelfPrefillUrl) { shelfPrefillUrl.value = data.websiteURL || ''; }
-                                    if (shelfPrefillSk) { shelfPrefillSk.value = data.websiteKey || ''; }
-                                    if (shelfPrefillAction) { shelfPrefillAction.value = data.action || ''; }
-                                    if (shelfPrefillCdata) { shelfPrefillCdata.value = data.cdata || ''; }
-                                    var run = !!data.running;
-                                    shelfStatusText.textContent = (run ? 'Running' : 'Stopped') + ' — shelved: ' + (data.totalShelved || 0);
-                                    if (shelfStartBtn) shelfStartBtn.disabled = run;
-                                    if (shelfStopBtn) shelfStopBtn.disabled = !run;
-                                }
-                            } catch (e) {
-                                shelfStatusText.textContent = 'Shelf status error';
-                            }
-                        }
-
-                        if (shelfApplyBtn) {
-                            shelfApplyBtn.addEventListener('click', async function () {
+                        var logoutBtn = document.getElementById('logout-btn');
+                        if (logoutBtn) {
+                            logoutBtn.addEventListener('click', async function () {
                                 try {
-                                    var body = {
-                                        maxAgeSeconds: shelfMaxAge ? Number(shelfMaxAge.value) : 50,
-                                        websiteURL: shelfPrefillUrl ? shelfPrefillUrl.value.trim() : '',
-                                        websiteKey: shelfPrefillSk ? shelfPrefillSk.value.trim() : '',
-                                        action: shelfPrefillAction ? shelfPrefillAction.value.trim() : '',
-                                        cdata: shelfPrefillCdata ? shelfPrefillCdata.value.trim() : ''
-                                    };
-                                    var res = await fetch('/setShelfSettings', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify(body)
-                                    });
-                                    var data = await res.json();
-                                    if (!data.success) {
-                                        alert(data.error || 'Failed to apply shelf settings');
-                                    }
-                                    await fetchShelfStatus();
-                                } catch (e) {
-                                    alert('Failed to apply shelf settings');
-                                }
+                                    await fetch('/logout', { method: 'POST', credentials: 'same-origin' });
+                                } catch (e) { }
+                                window.location.href = '/login';
                             });
                         }
-
-                        if (shelfStartBtn) {
-                            shelfStartBtn.addEventListener('click', async function () {
-                                try {
-                                    await fetch('/setShelfSettings', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                            maxAgeSeconds: shelfMaxAge ? Number(shelfMaxAge.value) : 50,
-                                            websiteURL: shelfPrefillUrl ? shelfPrefillUrl.value.trim() : '',
-                                            websiteKey: shelfPrefillSk ? shelfPrefillSk.value.trim() : '',
-                                            action: shelfPrefillAction ? shelfPrefillAction.value.trim() : '',
-                                            cdata: shelfPrefillCdata ? shelfPrefillCdata.value.trim() : ''
-                                        })
-                                    });
-                                    var res = await fetch('/shelfControl', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ running: true })
-                                    });
-                                    var data = await res.json();
-                                    if (!data.success) { alert('Failed to start shelf'); }
-                                    await fetchShelfStatus();
-                                } catch (e) {
-                                    alert('Failed to start shelf');
-                                }
-                            });
-                        }
-
-                        if (shelfStopBtn) {
-                            shelfStopBtn.addEventListener('click', async function () {
-                                try {
-                                    var res = await fetch('/shelfControl', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ running: false })
-                                    });
-                                    await res.json();
-                                    await fetchShelfStatus();
-                                } catch (e) {
-                                    alert('Failed to stop shelf');
-                                }
-                            });
-                        }
-
-                        fetchShelfStatus();
-                        setInterval(fetchShelfStatus, 5000);
 
                         // Add listeners for JSON copy buttons
                         var jsonCopyBtns = document.querySelectorAll('.copy-json-btn');
@@ -1830,7 +1958,7 @@ class TurnstileAPIServer:
 
 def parse_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Turnstile API Server")
+    parser = argparse.ArgumentParser(description="Cloudflare Turnstile API Server")
 
     parser.add_argument('--headless', action='store_true', help='Run the browser in headless mode, without opening a graphical interface. This option requires the --useragent argument to be set (default: False)')
     parser.add_argument('--useragent', type=str, default=None, help='Specify a custom User-Agent string for the browser. If not provided, the default User-Agent is used')
@@ -1859,7 +1987,7 @@ if __name__ == '__main__':
     if args.browser_type not in browser_types:
         logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")
     elif args.headless is True and args.useragent is None and "camoufox" not in args.browser_type:
-        logger.error(f"You must specify a {COLORS.get('YELLOW')}User-Agent{COLORS.get('RESET')} for Turnstile Solver or use {COLORS.get('GREEN')}camoufox{COLORS.get('RESET')} without useragent")
+        logger.error(f"You must specify a {COLORS.get('YELLOW')}User-Agent{COLORS.get('RESET')} for Cloudflare Turnstile Solver or use {COLORS.get('GREEN')}camoufox{COLORS.get('RESET')} without useragent")
     else:
         app = create_app(headless=args.headless, debug=args.debug, useragent=args.useragent, browser_type=args.browser_type, thread=args.thread, proxy_support=args.proxy)
         app.run(host=args.host, port=int(args.port))

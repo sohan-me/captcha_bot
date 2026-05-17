@@ -1,6 +1,6 @@
 <div align="center">
  
-  <h2 align="center">Cloudflare - Turnstile Solver</h2>
+  <h2 align="center">Cloudflare Turnstile Solver</h2>
   <p align="center">
 A Python-based Turnstile solver using the patchright library, featuring multi-threaded execution, API integration, and support for different browsers. It solves CAPTCHAs quickly and efficiently, with customizable configurations and detailed logging.
     <br />
@@ -102,7 +102,22 @@ A Python-based Turnstile solver using the patchright library, featuring multi-th
      ```bash
      python api_solver.py
      ```
-     
+
+7. **Admin dashboard** (first run):
+   - Create `admin.json` in the same folder:
+     ```bash
+     python admin.py
+     ```
+   - Optional: set environment variable `SECRET_KEY` to a long random string so admin login cookies stay valid across server restarts.
+   - Open `http://127.0.0.1:5000/` — you are redirected to `/login` until you sign in. Public API routes (`/createTask`, `/getTaskResult`, `/turnstile`, `/result`) are unchanged for clients that use API keys.
+
+### Performance and resources
+
+- The largest driver of **RAM and CPU** is how many **browser processes** you run: `--thread` together with **multi-thread** mode in the admin dashboard, and your `--browser_type` choice.
+- Use **headless** where it fits your workflow (see `--headless` / `--useragent` rules in the table below). Leaving **multi-thread** off keeps a single browser unless you need parallel throughput.
+- With `--proxy`, `proxies.txt` is cached and only reloaded when the file’s modification time changes.
+- `results.json` is flushed on a short **debounce** after solves (and again on process exit) to cut disk I/O; the in-memory task results the API returns are always updated immediately.
+
 ---
 
 ### 🔧 Command line arguments
@@ -116,24 +131,6 @@ A Python-based Turnstile solver using the patchright library, featuring multi-th
 | `--host`       | `127.0.0.1` | `string`  | Specifies the IP address the API solver runs on.                                            |
 | `--port`       | `5000`   | `integer` | Sets the port the API solver listens on.                                                    |
 | `--proxy`       | `False`   | `boolean` | Select a random proxy from proxies.txt for solving captchas                                                   |
-
----
-
-### 🐳 Docker Image
-#### Running the Container
-To start the container, use:
-- Change the TZ environment variable and ports to the correct one for yourself:
-```sh
-docker run -d -p 3389:3389 -p 5000:5000 -e TZ=Asia/Baku --name turnstile_solver theyka/turnstile_solver:latest
-```
-
-#### Connecting to the Container
-1. Use an **RDP client** (like Windows Remote Desktop, Remmina, or FreeRDP)
-2. Connect to `localhost:3389`
-3. Login with the default user:
-   - **Username:** root
-   - **Password:** root
-4. After this, you can start the solver by navigating to the `Turnstile-Solver` folder.
 
 ---
 
