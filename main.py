@@ -1,8 +1,15 @@
+import os
 import sys
 import time
 import logging
 import asyncio
 from api_solver import create_app
+
+# Headless Chromium on Linux needs a real UA string (Playwright + this project’s api_solver rules).
+_DEFAULT_HEADLESS_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 
 
 class CustomLogger(logging.Logger):
@@ -67,8 +74,31 @@ class TurnstileTester:
     async def main(self) -> None:
         logger.info("Cloudflare Turnstile: Welcome — starting API server")
 
+        want_headed = os.environ.get("TURNSTILE_HEADED", "").lower() in ("1", "true", "yes", "on")
+        has_display = bool(os.environ.get("DISPLAY"))
+        # VPS / systemd: no X11 → must use headless or xvfb-run.
+        headless = not (want_headed and has_display)
+        if want_headed and not has_display:
+            logger.warning(
+                "TURNSTILE_HEADED is set but DISPLAY is missing — using headless mode (required on a headless server)"
+            )
+
+        browser_type = (os.environ.get("TURNSTILE_BROWSER") or "chromium").strip() or "chromium"
+
+        useragent = os.environ.get("TURNSTILE_USER_AGENT")
+        if isinstance(useragent, str):
+            useragent = useragent.strip() or None
+        if headless and "camoufox" not in browser_type.lower():
+            useragent = useragent or _DEFAULT_HEADLESS_UA
+
+        logger.info(f"Browser: type={browser_type}, headless={headless}")
+
         try:
-            await self.run_api_server()
+            await self.run_api_server(
+                headless=headless,
+                useragent=useragent,
+                browser_type=browser_type,
+            )
         except KeyboardInterrupt:
             logger.warning("\nOperation cancelled by user")
         except Exception as e:
@@ -78,5 +108,14 @@ class TurnstileTester:
 
 
 if __name__ == "__main__":
+    # Under PM2 / systemd, stdout is often not a TTY and may be fully block-buffered, so log
+    # files stay at 0 bytes until exit unless we line-buffer or use PYTHONUNBUFFERED=1 / python -u.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+    print("[captcha_bot] starting", flush=True)
+
     tester = TurnstileTester()
     asyncio.run(tester.main())
