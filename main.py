@@ -95,29 +95,19 @@ class TurnstileTester:
         logger.info("Cloudflare Turnstile: Welcome — starting API server")
 
         want_headed = os.environ.get("TURNSTILE_HEADED", "").lower() in ("1", "true", "yes", "on")
-        has_display = bool(os.environ.get("DISPLAY"))
-        allow_headless_fallback = os.environ.get("TURNSTILE_ALLOW_HEADLESS_FALLBACK", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        # VPS: real headed mode needs a display — use xvfb-run (see scripts/start-headed-xvfb.sh).
-        headless = not (want_headed and has_display)
-        if want_headed and not has_display:
-            msg = (
-                "TURNSTILE_HEADED is on but DISPLAY is unset. Cloudflare often fails pure headless on VPS. "
-                "Run under a virtual framebuffer, e.g.:\n"
-                "  xvfb-run -a -s '-screen 0 1280x720x24' ./.venv/bin/python main.py\n"
-                "Or: bash scripts/start-headed-xvfb.sh\n"
-                "To force headless anyway: TURNSTILE_ALLOW_HEADLESS_FALLBACK=1"
+        # Unix/Linux: headed needs DISPLAY. Windows: no DISPLAY; use headed when TURNSTILE_HEADED is set.
+        if os.name == "nt":
+            can_headed = want_headed
+        else:
+            can_headed = want_headed and bool(os.environ.get("DISPLAY"))
+        headless = not can_headed
+        if want_headed and not can_headed:
+            logger.warning(
+                "TURNSTILE_HEADED is set but there is no GUI display (DISPLAY unset on Unix) — using headless mode."
             )
-            if not allow_headless_fallback:
-                logger.error(msg)
-                raise SystemExit(1)
-            logger.warning(msg + " — continuing in headless mode (TURNSTILE_ALLOW_HEADLESS_FALLBACK is set).")
 
-        browser_type = (os.environ.get("TURNSTILE_BROWSER") or "chromium").strip() or "chromium"
+        # Default matches Archive start_server.bat / api_solver.py (camoufox).
+        browser_type = (os.environ.get("TURNSTILE_BROWSER") or "camoufox").strip() or "camoufox"
 
         useragent = os.environ.get("TURNSTILE_USER_AGENT")
         if isinstance(useragent, str):

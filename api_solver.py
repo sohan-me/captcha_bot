@@ -524,9 +524,21 @@ class TurnstileAPIServer:
 
         start_time = time.time()
 
-        try:
-            # Hard timeout avoids tasks hanging forever and blocking the browser pool.
-            async with asyncio.timeout(45):
+        async def _solve_core():
+            nonlocal context, selected_proxy
+            if selected_proxy:
+                parts = selected_proxy.split(':')
+                if len(parts) == 3:
+                    context = await browser.new_context(proxy={"server": f"{selected_proxy}"}, user_agent=useragent)
+                elif len(parts) == 5:
+                    proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
+                    context = await browser.new_context(proxy={"server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}", "username": proxy_user, "password": proxy_pass}, user_agent=useragent)
+                else:
+                    raise ValueError("Invalid proxy format")
+            elif self.proxy_support:
+                proxies = self._get_proxies_list_cached()
+                selected_proxy = random.choice(proxies) if proxies else None
+
                 if selected_proxy:
                     parts = selected_proxy.split(':')
                     if len(parts) == 3:
@@ -536,121 +548,112 @@ class TurnstileAPIServer:
                         context = await browser.new_context(proxy={"server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}", "username": proxy_user, "password": proxy_pass}, user_agent=useragent)
                     else:
                         raise ValueError("Invalid proxy format")
-                elif self.proxy_support:
-                    proxies = self._get_proxies_list_cached()
-                    selected_proxy = random.choice(proxies) if proxies else None
-
-                    if selected_proxy:
-                        parts = selected_proxy.split(':')
-                        if len(parts) == 3:
-                            context = await browser.new_context(proxy={"server": f"{selected_proxy}"}, user_agent=useragent)
-                        elif len(parts) == 5:
-                            proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                            context = await browser.new_context(proxy={"server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}", "username": proxy_user, "password": proxy_pass}, user_agent=useragent)
-                        else:
-                            raise ValueError("Invalid proxy format")
-                    else:
-                        context = await browser.new_context(user_agent=useragent)
                 else:
                     context = await browser.new_context(user_agent=useragent)
+            else:
+                context = await browser.new_context(user_agent=useragent)
 
-                page = await context.new_page()
+            page = await context.new_page()
 
+            if self.debug:
+                logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Proxy: {selected_proxy}")
+                logger.debug(f"Browser {index}: Setting up page data and route")
+
+            url_with_slash = url + "/" if not url.endswith("/") else url
+            turnstile_div = f'<div class="cf-turnstile" style="background: white;" data-sitekey="{sitekey}"' + (f' data-action="{action}"' if action else '') + (f' data-cdata="{cdata}"' if cdata else '') + '></div>'
+            page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
+
+            # We must NOT block Cloudflare's own domains or the Turnstile script will fail.
+            # We also shouldn't block everything blindly, as some sites break completely if CSS is missing.
+            # Let's revert the aggressive blocking and just rely on domcontentloaded.
+            await page.route(url_with_slash, lambda route: route.continue_())
+
+            try:
+                # Navigate to the real URL to establish actual TLS/network context
+                await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=15000)
+            except Exception as e:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Proxy: {selected_proxy}")
-                    logger.debug(f"Browser {index}: Setting up page data and route")
+                    logger.debug(f"Browser {index}: Initial navigation error (ignored): {e}")
 
-                url_with_slash = url + "/" if not url.endswith("/") else url
-                turnstile_div = f'<div class="cf-turnstile" style="background: white;" data-sitekey="{sitekey}"' + (f' data-action="{action}"' if action else '') + (f' data-cdata="{cdata}"' if cdata else '') + '></div>'
-                page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
-
-                # We must NOT block Cloudflare's own domains or the Turnstile script will fail.
-                # We also shouldn't block everything blindly, as some sites break completely if CSS is missing.
-                # Let's revert the aggressive blocking and just rely on domcontentloaded.
-                await page.route(url_with_slash, lambda route: route.continue_())
-
-                try:
-                    # Navigate to the real URL to establish actual TLS/network context
-                    await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=15000)
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Initial navigation error (ignored): {e}")
-
-                # Instead of document.write (which destroys the real page's scripts/context),
-                # we inject the Turnstile script and widget directly into the live DOM.
-                await page.evaluate(f'''() => {{
-                    // Clear the body entirely to remove site's original widgets, ensuring only ONE widget exists
-                    // This speeds up the process and prevents duplicate widget issues
-                    document.body.innerHTML = '';
-                    document.body.style.backgroundColor = '#ffffff';
-                    document.body.style.display = 'flex';
-                    document.body.style.justifyContent = 'center';
-                    document.body.style.alignItems = 'center';
-                    document.body.style.height = '100vh';
-                    document.body.style.margin = '0';
-                    
-                    // Create our targeted widget
-                    const div = document.createElement('div');
-                    div.className = 'cf-turnstile';
-                    div.id = 'solver-widget';
-                    div.setAttribute('data-sitekey', '{sitekey}');
-                    {f"div.setAttribute('data-action', '{action}');" if action else ""}
-                    {f"div.setAttribute('data-cdata', '{cdata}');" if cdata else ""}
-                    document.body.appendChild(div);
-                    
-                    // Inject the API script if not present
-                    if (!document.querySelector('script[src*="turnstile/v0/api.js"]')) {{
-                        const script = document.createElement('script');
-                        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-                        script.async = true;
-                        script.defer = true;
-                        document.head.appendChild(script);
-                    }} else {{
-                        // If already present, force render
-                        if (window.turnstile) {{
-                            window.turnstile.render(div);
-                        }}
+            # Instead of document.write (which destroys the real page's scripts/context),
+            # we inject the Turnstile script and widget directly into the live DOM.
+            await page.evaluate(f'''() => {{
+                // Clear the body entirely to remove site's original widgets, ensuring only ONE widget exists
+                // This speeds up the process and prevents duplicate widget issues
+                document.body.innerHTML = '';
+                document.body.style.backgroundColor = '#ffffff';
+                document.body.style.display = 'flex';
+                document.body.style.justifyContent = 'center';
+                document.body.style.alignItems = 'center';
+                document.body.style.height = '100vh';
+                document.body.style.margin = '0';
+                
+                // Create our targeted widget
+                const div = document.createElement('div');
+                div.className = 'cf-turnstile';
+                div.id = 'solver-widget';
+                div.setAttribute('data-sitekey', '{sitekey}');
+                {f"div.setAttribute('data-action', '{action}');" if action else ""}
+                {f"div.setAttribute('data-cdata', '{cdata}');" if cdata else ""}
+                document.body.appendChild(div);
+                
+                // Inject the API script if not present
+                if (!document.querySelector('script[src*="turnstile/v0/api.js"]')) {{
+                    const script = document.createElement('script');
+                    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+                    script.async = true;
+                    script.defer = true;
+                    document.head.appendChild(script);
+                }} else {{
+                    // If already present, force render
+                    if (window.turnstile) {{
+                        window.turnstile.render(div);
                     }}
-                }}''')
+                }}
+            }}''')
 
-                if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile response retrieval loop")
+            if self.debug:
+                logger.debug(f"Browser {index}: Starting Turnstile response retrieval loop")
 
-                for _ in range(15):
-                    try:
-                        turnstile_check = ""
-                        response_inputs = page.locator("[name=cf-turnstile-response]")
+            for _ in range(15):
+                try:
+                    turnstile_check = ""
+                    response_inputs = page.locator("[name=cf-turnstile-response]")
+                    
+                    if await response_inputs.count() > 0:
+                        turnstile_check = await response_inputs.first.input_value(timeout=1000)
                         
-                        if await response_inputs.count() > 0:
-                            turnstile_check = await response_inputs.first.input_value(timeout=1000)
-                            
-                        if turnstile_check == "":
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Attempt {_} - No Turnstile response yet")
+                    if turnstile_check == "":
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Attempt {_} - No Turnstile response yet")
 
-                            widget = page.locator(".cf-turnstile").first
-                            if await widget.count() > 0:
-                                await widget.click(timeout=1000)
-                            await asyncio.sleep(0.5)
-                        else:
-                            elapsed_time = round(time.time() - start_time, 3)
+                        widget = page.locator(".cf-turnstile").first
+                        if await widget.count() > 0:
+                            await widget.click(timeout=1000)
+                        await asyncio.sleep(0.5)
+                    else:
+                        elapsed_time = round(time.time() - start_time, 3)
 
-                            logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{turnstile_check[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{turnstile_check[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
 
-                            self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
-                            await self._request_debounced_results_save()
-                            if client_key:
-                                self._increment_usage(client_key)
-                            break
-                    except:
-                        pass
+                        self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
+                        await self._request_debounced_results_save()
+                        if client_key:
+                            self._increment_usage(client_key)
+                        break
+                except:
+                    pass
 
-                if self.results.get(task_id) == "CAPTCHA_NOT_READY":
-                    elapsed_time = round(time.time() - start_time, 3)
-                    self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
-                    if self.debug:
-                        logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-        except TimeoutError:
+            if self.results.get(task_id) == "CAPTCHA_NOT_READY":
+                elapsed_time = round(time.time() - start_time, 3)
+                self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
+                if self.debug:
+                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+
+        try:
+            # asyncio.timeout() exists only in Python 3.11+; wait_for works on 3.10 (common on Ubuntu LTS VPS).
+            await asyncio.wait_for(_solve_core(), timeout=45.0)
+        except asyncio.TimeoutError:
             elapsed_time = round(time.time() - start_time, 3)
             self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
             logger.error(f"Browser {index}: Timeout solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
@@ -659,8 +662,9 @@ class TurnstileAPIServer:
             self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
             if "Connection closed while reading from the driver" in str(e):
                 recreate_browser = True
+            logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
             if self.debug:
-                logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
+                logger.debug(f"Browser {index}: Turnstile solve traceback", exc_info=True)
         finally:
             if self.debug:
                 logger.debug(f"Browser {index}: Clearing page state")
