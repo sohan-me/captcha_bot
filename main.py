@@ -49,11 +49,31 @@ handler = logging.StreamHandler(sys.stdout)
 logger.addHandler(handler)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip(), 10)
+    except ValueError:
+        return default
+
+
 class TurnstileTester:
-    async def run_api_server(self, debug=False, headless=False, useragent=None, browser_type="chromium", thread=1) -> None:
+    async def run_api_server(
+        self,
+        debug=False,
+        headless=False,
+        useragent=None,
+        browser_type="chromium",
+        thread=1,
+        bind_host="127.0.0.1",
+        bind_port=5000,
+    ) -> None:
         """Run the API server with logging."""
-        logger.info("Starting API server on http://localhost:5000")
-        logger.info("API documentation available at http://localhost:5000/")
+        bind = f"{bind_host}:{bind_port}"
+        logger.info(f"Starting API server on http://{bind}")
+        logger.info(f"API documentation available at http://{bind}/")
 
         try:
             app = create_app(
@@ -66,7 +86,7 @@ class TurnstileTester:
             )
             import hypercorn.asyncio
             config = hypercorn.Config()
-            config.bind = ["127.0.0.1:5000"]
+            config.bind = [bind]
             await hypercorn.asyncio.serve(app, config)
         except Exception as e:
             logger.error(f"API server failed to start: {str(e)}")
@@ -76,12 +96,26 @@ class TurnstileTester:
 
         want_headed = os.environ.get("TURNSTILE_HEADED", "").lower() in ("1", "true", "yes", "on")
         has_display = bool(os.environ.get("DISPLAY"))
-        # VPS / systemd: no X11 → must use headless or xvfb-run.
+        allow_headless_fallback = os.environ.get("TURNSTILE_ALLOW_HEADLESS_FALLBACK", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        # VPS: real headed mode needs a display — use xvfb-run (see scripts/start-headed-xvfb.sh).
         headless = not (want_headed and has_display)
         if want_headed and not has_display:
-            logger.warning(
-                "TURNSTILE_HEADED is set but DISPLAY is missing — using headless mode (required on a headless server)"
+            msg = (
+                "TURNSTILE_HEADED is on but DISPLAY is unset. Cloudflare often fails pure headless on VPS. "
+                "Run under a virtual framebuffer, e.g.:\n"
+                "  xvfb-run -a -s '-screen 0 1280x720x24' ./.venv/bin/python main.py\n"
+                "Or: bash scripts/start-headed-xvfb.sh\n"
+                "To force headless anyway: TURNSTILE_ALLOW_HEADLESS_FALLBACK=1"
             )
+            if not allow_headless_fallback:
+                logger.error(msg)
+                raise SystemExit(1)
+            logger.warning(msg + " — continuing in headless mode (TURNSTILE_ALLOW_HEADLESS_FALLBACK is set).")
 
         browser_type = (os.environ.get("TURNSTILE_BROWSER") or "chromium").strip() or "chromium"
 
@@ -91,13 +125,20 @@ class TurnstileTester:
         if headless and "camoufox" not in browser_type.lower():
             useragent = useragent or _DEFAULT_HEADLESS_UA
 
-        logger.info(f"Browser: type={browser_type}, headless={headless}")
+        bind_host = (os.environ.get("TURNSTILE_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+        bind_port = _env_int("TURNSTILE_PORT", 5000)
+        thread = max(1, _env_int("TURNSTILE_THREAD", 1))
+
+        logger.info(f"Browser: type={browser_type}, headless={headless}, thread={thread}")
 
         try:
             await self.run_api_server(
                 headless=headless,
                 useragent=useragent,
                 browser_type=browser_type,
+                thread=thread,
+                bind_host=bind_host,
+                bind_port=bind_port,
             )
         except KeyboardInterrupt:
             logger.warning("\nOperation cancelled by user")
