@@ -563,13 +563,27 @@ class TurnstileAPIServer:
             turnstile_div = f'<div class="cf-turnstile" style="background: white;" data-sitekey="{sitekey}"' + (f' data-action="{action}"' if action else '') + (f' data-cdata="{cdata}"' if cdata else '') + '></div>'
             page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
 
-            # We must NOT block Cloudflare's own domains or the Turnstile script will fail.
-            # We also shouldn't block everything blindly, as some sites break completely if CSS is missing.
-            # Let's revert the aggressive blocking and just rely on domcontentloaded.
-            await page.route(url_with_slash, lambda route: route.continue_())
+            # Serve our own HTML for the navigation so we never hit any page-level
+            # Cloudflare challenge on the target hostname (e.g. visa.vfsglobal.com).
+            # The page's window.location.origin will still be the real hostname,
+            # which is what Turnstile needs for sitekey/origin validation.
+            async def _fulfill_with_template(route):
+                try:
+                    await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=page_data)
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: route.fulfill error (falling back to continue): {e}")
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+
+            await page.route(url_with_slash, _fulfill_with_template)
 
             try:
-                # Navigate to the real URL to establish actual TLS/network context
+                # Navigate to the real URL to establish actual TLS/network context.
+                # The route handler above intercepts and serves our template instead
+                # of the real site response, sidestepping any page-level CF challenge.
                 await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=20000)
             except Exception as e:
                 if self.debug:
@@ -577,40 +591,36 @@ class TurnstileAPIServer:
             # Small breath so any CF interstitial JS settles before we wipe the body
             await asyncio.sleep(0.3)
 
-            # Instead of document.write (which destroys the real page's scripts/context),
-            # we inject the Turnstile script and widget directly into the live DOM.
+            # Ensure the Turnstile widget is present and the API script is loaded.
+            # Idempotent: if our route already served the template, this is a no-op
+            # for the widget; we only force-render if the script was already cached.
             await page.evaluate(f'''() => {{
-                // Clear the body entirely to remove site's original widgets, ensuring only ONE widget exists
-                // This speeds up the process and prevents duplicate widget issues
-                document.body.innerHTML = '';
-                document.body.style.backgroundColor = '#ffffff';
-                document.body.style.display = 'flex';
-                document.body.style.justifyContent = 'center';
-                document.body.style.alignItems = 'center';
-                document.body.style.height = '100vh';
-                document.body.style.margin = '0';
-                
-                // Create our targeted widget
-                const div = document.createElement('div');
-                div.className = 'cf-turnstile';
-                div.id = 'solver-widget';
-                div.setAttribute('data-sitekey', '{sitekey}');
-                {f"div.setAttribute('data-action', '{action}');" if action else ""}
-                {f"div.setAttribute('data-cdata', '{cdata}');" if cdata else ""}
-                document.body.appendChild(div);
-                
-                // Inject the API script if not present
+                if (!document.querySelector('.cf-turnstile')) {{
+                    document.body.innerHTML = '';
+                    document.body.style.backgroundColor = '#ffffff';
+                    document.body.style.display = 'flex';
+                    document.body.style.justifyContent = 'center';
+                    document.body.style.alignItems = 'center';
+                    document.body.style.height = '100vh';
+                    document.body.style.margin = '0';
+
+                    const div = document.createElement('div');
+                    div.className = 'cf-turnstile';
+                    div.id = 'solver-widget';
+                    div.setAttribute('data-sitekey', '{sitekey}');
+                    {f"div.setAttribute('data-action', '{action}');" if action else ""}
+                    {f"div.setAttribute('data-cdata', '{cdata}');" if cdata else ""}
+                    document.body.appendChild(div);
+                }}
+
                 if (!document.querySelector('script[src*="turnstile/v0/api.js"]')) {{
                     const script = document.createElement('script');
                     script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
                     script.async = true;
                     script.defer = true;
                     document.head.appendChild(script);
-                }} else {{
-                    // If already present, force render
-                    if (window.turnstile) {{
-                        window.turnstile.render(div);
-                    }}
+                }} else if (window.turnstile) {{
+                    try {{ window.turnstile.render('.cf-turnstile'); }} catch (e) {{}}
                 }}
             }}''')
 
