@@ -570,10 +570,12 @@ class TurnstileAPIServer:
 
             try:
                 # Navigate to the real URL to establish actual TLS/network context
-                await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=15000)
+                await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=20000)
             except Exception as e:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Initial navigation error (ignored): {e}")
+                    logger.debug(f"Browser {index}: Initial navigation error (ignored, will inject widget anyway): {e}")
+            # Small breath so any CF interstitial JS settles before we wipe the body
+            await asyncio.sleep(0.3)
 
             # Instead of document.write (which destroys the real page's scripts/context),
             # we inject the Turnstile script and widget directly into the live DOM.
@@ -615,34 +617,44 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Starting Turnstile response retrieval loop")
 
-            for _ in range(15):
+            SOLVE_DEADLINE_SEC = 40
+            solve_deadline = time.time() + SOLVE_DEADLINE_SEC
+            attempt = 0
+            while time.time() < solve_deadline:
+                attempt += 1
                 try:
                     turnstile_check = ""
                     response_inputs = page.locator("[name=cf-turnstile-response]")
-                    
+
                     if await response_inputs.count() > 0:
                         turnstile_check = await response_inputs.first.input_value(timeout=1000)
-                        
+
                     if turnstile_check == "":
                         if self.debug:
-                            logger.debug(f"Browser {index}: Attempt {_} - No Turnstile response yet")
+                            remaining = round(solve_deadline - time.time(), 1)
+                            logger.debug(f"Browser {index}: Attempt {attempt} - no token yet ({remaining}s left)")
 
                         widget = page.locator(".cf-turnstile").first
                         if await widget.count() > 0:
-                            await widget.click(timeout=1000)
+                            try:
+                                await widget.click(timeout=1000)
+                            except Exception:
+                                pass
                         await asyncio.sleep(0.5)
                     else:
                         elapsed_time = round(time.time() - start_time, 3)
 
-                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{turnstile_check[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{turnstile_check[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds (attempt {attempt})")
 
                         self.results[task_id] = {"value": turnstile_check, "elapsed_time": elapsed_time}
                         await self._request_debounced_results_save()
                         if client_key:
                             self._increment_usage(client_key)
                         break
-                except:
-                    pass
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: poll iter {attempt} exception: {e}")
+                    await asyncio.sleep(0.5)
 
             if self.results.get(task_id) == "CAPTCHA_NOT_READY":
                 elapsed_time = round(time.time() - start_time, 3)
@@ -652,7 +664,7 @@ class TurnstileAPIServer:
 
         try:
             # asyncio.timeout() exists only in Python 3.11+; wait_for works on 3.10 (common on Ubuntu LTS VPS).
-            await asyncio.wait_for(_solve_core(), timeout=45.0)
+            await asyncio.wait_for(_solve_core(), timeout=60.0)
         except asyncio.TimeoutError:
             elapsed_time = round(time.time() - start_time, 3)
             self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}
