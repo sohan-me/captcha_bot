@@ -1,2 +1,5 @@
-protocol://ip:port:username:password
-protocol://ip:port
+# Add one proxy per line (see proxies.txt.example). Lines starting with # are ignored by the loader
+# only if you strip comments — remove these sample lines and add real proxies:
+# http:203.0.113.10:8080
+# http:203.0.113.10:8080:user:pass
+

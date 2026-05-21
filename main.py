@@ -59,6 +59,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 class TurnstileTester:
     async def run_api_server(
         self,
@@ -69,6 +76,7 @@ class TurnstileTester:
         thread=1,
         bind_host="127.0.0.1",
         bind_port=5000,
+        proxy_support=False,
     ) -> None:
         """Run the API server with logging."""
         bind = f"{bind_host}:{bind_port}"
@@ -82,7 +90,7 @@ class TurnstileTester:
                 useragent=useragent,
                 browser_type=browser_type,
                 thread=thread,
-                proxy_support=False,
+                proxy_support=proxy_support,
             )
             import hypercorn.asyncio
             config = hypercorn.Config()
@@ -118,8 +126,19 @@ class TurnstileTester:
         bind_host = (os.environ.get("TURNSTILE_HOST") or "127.0.0.1").strip() or "127.0.0.1"
         bind_port = _env_int("TURNSTILE_PORT", 5000)
         thread = max(1, _env_int("TURNSTILE_THREAD", 1))
+        proxy_support = _env_bool("TURNSTILE_PROXY", False)
 
-        logger.info(f"Browser: type={browser_type}, headless={headless}, thread={thread}")
+        logger.info(
+            f"Browser: type={browser_type}, headless={headless}, thread={thread}, proxy_support={proxy_support}"
+        )
+        if proxy_support:
+            proxies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
+            if os.path.isfile(proxies_path):
+                logger.info(f"Proxy pool: proxies.txt (random per solve when task has no proxy)")
+            else:
+                logger.warning(
+                    "TURNSTILE_PROXY is on but proxies.txt is missing — only per-task proxy= in API requests will work."
+                )
 
         try:
             await self.run_api_server(
@@ -129,6 +148,7 @@ class TurnstileTester:
                 thread=thread,
                 bind_host=bind_host,
                 bind_port=bind_port,
+                proxy_support=proxy_support,
             )
         except KeyboardInterrupt:
             logger.warning("\nOperation cancelled by user")

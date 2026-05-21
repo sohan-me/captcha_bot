@@ -76,6 +76,56 @@ _CHROMIUM_LOW_RESOURCE_ARGS = (
 RESULTS_SAVE_DEBOUNCE_SEC = 15.0
 
 
+def playwright_proxy_from_string(proxy_str: str) -> dict:
+    """Build a Playwright proxy dict from common client formats.
+
+    Supported:
+      - http:host:port
+      - http:host:port:user:pass   (IVAC / VFS captcha bot format)
+      - host:port                  (http assumed)
+      - http://host:port
+      - http://user:pass@host:port
+    """
+    s = (proxy_str or "").strip()
+    if not s:
+        raise ValueError("Empty proxy string")
+
+    if "://" in s:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(s)
+        if not parsed.hostname or not parsed.port:
+            raise ValueError(f"Invalid proxy URL: {proxy_str!r}")
+        scheme = parsed.scheme or "http"
+        server = f"{scheme}://{parsed.hostname}:{parsed.port}"
+        if parsed.username:
+            return {
+                "server": server,
+                "username": parsed.username,
+                "password": parsed.password or "",
+            }
+        return {"server": server}
+
+    parts = s.split(":")
+    if len(parts) == 2:
+        host, port = parts
+        return {"server": f"http://{host}:{port}"}
+    if len(parts) == 3:
+        scheme, host, port = parts
+        return {"server": f"{scheme}://{host}:{port}"}
+    if len(parts) == 5:
+        scheme, host, port, user, passwd = parts
+        return {
+            "server": f"{scheme}://{host}:{port}",
+            "username": user,
+            "password": passwd,
+        }
+    raise ValueError(
+        f"Invalid proxy format: {proxy_str!r}. "
+        "Use http:host:port or http:host:port:user:pass (or a full http:// URL)."
+    )
+
+
 class TurnstileAPIServer:
     HTML_TEMPLATE = """
     <!DOCTYPE html>
@@ -173,7 +223,11 @@ class TurnstileAPIServer:
             return self._proxies_cache_list
         try:
             with open(path, encoding="utf-8") as proxy_file:
-                lines = [line.strip() for line in proxy_file if line.strip()]
+                lines = [
+                    line.strip()
+                    for line in proxy_file
+                    if line.strip() and not line.strip().startswith("#")
+                ]
         except OSError as e:
             if self.debug:
                 logger.warning(f"Could not read proxies.txt: {e}")
@@ -526,28 +580,18 @@ class TurnstileAPIServer:
 
         async def _solve_core():
             nonlocal context, selected_proxy
+
+            async def _new_context_with_proxy(proxy_line: str):
+                pw_proxy = playwright_proxy_from_string(proxy_line)
+                return await browser.new_context(proxy=pw_proxy, user_agent=useragent)
+
             if selected_proxy:
-                parts = selected_proxy.split(':')
-                if len(parts) == 3:
-                    context = await browser.new_context(proxy={"server": f"{selected_proxy}"}, user_agent=useragent)
-                elif len(parts) == 5:
-                    proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                    context = await browser.new_context(proxy={"server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}", "username": proxy_user, "password": proxy_pass}, user_agent=useragent)
-                else:
-                    raise ValueError("Invalid proxy format")
+                context = await _new_context_with_proxy(selected_proxy)
             elif self.proxy_support:
                 proxies = self._get_proxies_list_cached()
                 selected_proxy = random.choice(proxies) if proxies else None
-
                 if selected_proxy:
-                    parts = selected_proxy.split(':')
-                    if len(parts) == 3:
-                        context = await browser.new_context(proxy={"server": f"{selected_proxy}"}, user_agent=useragent)
-                    elif len(parts) == 5:
-                        proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                        context = await browser.new_context(proxy={"server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}", "username": proxy_user, "password": proxy_pass}, user_agent=useragent)
-                    else:
-                        raise ValueError("Invalid proxy format")
+                    context = await _new_context_with_proxy(selected_proxy)
                 else:
                     context = await browser.new_context(user_agent=useragent)
             else:
@@ -578,17 +622,31 @@ class TurnstileAPIServer:
                     except Exception:
                         pass
 
+            # Intercept all navigation requests to the target hostname so we
+            # always serve our template regardless of Cloudflare redirects or
+            # interstitial pages (/cdn-cgi/challenge, /cdn-cgi/challenge-platform/…).
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(url)
+            _origin = f"{_parsed.scheme}://{_parsed.netloc}"
+            await page.route(f"{_origin}/**", _fulfill_with_template)
+            # Also intercept the exact root URL as a fallback
             await page.route(url_with_slash, _fulfill_with_template)
 
             try:
-                # Navigate to the real URL to establish actual TLS/network context.
-                # The route handler above intercepts and serves our template instead
-                # of the real site response, sidestepping any page-level CF challenge.
+                # Navigate to the real URL. The route handler intercepts and serves
+                # our template, establishing window.location.origin = target hostname
+                # which Turnstile needs for sitekey/origin validation.
                 await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=20000)
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: Initial navigation error (ignored, will inject widget anyway): {e}")
-            # Small breath so any CF interstitial JS settles before we wipe the body
+                # If goto failed (e.g. blocked entirely), force-navigate to our template
+                # via data: URI won't work (origin mismatch), so try a second goto
+                try:
+                    await page.goto(url_with_slash, wait_until="commit", timeout=10000)
+                except Exception:
+                    pass
+            # Small breath so any JS settles before we check for the widget
             await asyncio.sleep(0.3)
 
             # Ensure the Turnstile widget is present and the API script is loaded.
@@ -624,10 +682,18 @@ class TurnstileAPIServer:
                 }}
             }}''')
 
+            # Wait for the Turnstile widget to appear before polling.
+            # The script is async so it needs a few seconds to load and render.
+            try:
+                await page.wait_for_selector(".cf-turnstile iframe, [name=cf-turnstile-response]", timeout=12000)
+            except Exception:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Turnstile widget not found via wait_for_selector after 12s, continuing anyway")
+
             if self.debug:
                 logger.debug(f"Browser {index}: Starting Turnstile response retrieval loop")
 
-            SOLVE_DEADLINE_SEC = 40
+            SOLVE_DEADLINE_SEC = 55
             solve_deadline = time.time() + SOLVE_DEADLINE_SEC
             attempt = 0
             while time.time() < solve_deadline:
@@ -674,7 +740,7 @@ class TurnstileAPIServer:
 
         try:
             # asyncio.timeout() exists only in Python 3.11+; wait_for works on 3.10 (common on Ubuntu LTS VPS).
-            await asyncio.wait_for(_solve_core(), timeout=60.0)
+            await asyncio.wait_for(_solve_core(), timeout=75.0)
         except asyncio.TimeoutError:
             elapsed_time = round(time.time() - start_time, 3)
             self.results[task_id] = {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time}

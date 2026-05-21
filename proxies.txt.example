@@ -1,0 +1,10 @@
+# One proxy per line. Used when --proxy / TURNSTILE_PROXY=1 and the API task has no proxy field.
+# Formats (same as IVAC/VFS createTask task.proxy):
+#   http:host:port
+#   http:host:port:username:password
+#   http://host:port
+#   http://username:password@host:port
+#
+# Examples (replace with your proxies):
+# http:203.0.113.10:8080
+# http:203.0.113.10:8080:myuser:mypass
